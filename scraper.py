@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """Swiggy restaurant menu scraper.
 
-Usage:
-    python scraper.py "https://www.swiggy.com/city/delhi/restaurant-name-rest12345"
+Swiggy is behind Akamai Bot Manager, which blocks automated browsers (403 / blank
+page). To get around it, this script does NOT launch its own browser. Instead it
+attaches over the Chrome DevTools Protocol to a real Chrome that YOU started and
+in which YOU opened the restaurant page — a genuine human session Akamai trusts.
 
-Scrapes each dish (name, price, description, image) from a Swiggy menu page,
-writes menu.csv and downloads images into a folder named after the restaurant slug.
+Workflow:
+    1. Start Chrome with remote debugging (quit any running Chrome first):
+         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
+             --remote-debugging-port=9222 --user-data-dir="$HOME/.swiggy-chrome"
+    2. In that Chrome, open the restaurant menu page and let it fully load.
+    3. Run:
+         python scraper.py "https://www.swiggy.com/city/delhi/restaurant-name-rest12345"
+
+The script finds the already-open Swiggy tab, scrolls it to trigger lazy images,
+extracts each dish (name, price, description, image), writes menu.csv and
+downloads images into a folder named after the restaurant slug. It does not close
+your browser.
 """
 
 import asyncio
@@ -18,11 +30,15 @@ from urllib.parse import urlparse
 import httpx
 from playwright.async_api import async_playwright
 
+# Used only as a header for httpx image downloads, to mirror a real Chrome.
 CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/137.0.0.0 Safari/537.36"
 )
+
+# Port the user started Chrome with: --remote-debugging-port=<CDP_PORT>
+CDP_PORT = 9222
 
 # Selectors tried in order. Swiggy hashes class names, so we fall back through
 # several patterns and log which one yielded items.
@@ -87,8 +103,13 @@ async def extract_dishes(page) -> tuple[list[dict], str | None]:
     return [], None
 
 
-# Runs in the browser. For each matched node, pull name/price/description/image
-# using loose heuristics that survive hashed class names.
+# Runs in the browser. For each matched node, pull name/price/description/image.
+# Swiggy renders a hidden accessibility <p>/aria-label per dish of the form:
+#   "Veg Item. <Name>. [This item is a Bestseller,] Costs: <N> rupees,
+#    [Description: <desc>] [This item is customizable.] Swipe right to add..."
+# We parse that string (the cleanest signal) and read the dish name/photo from
+# the <img>. If the accessibility string is absent (selector matched a different
+# layout), we fall back to loose innerText heuristics.
 _EXTRACT_JS = r"""
 (selector) => {
   const nodes = Array.from(document.querySelectorAll(selector));
@@ -100,40 +121,50 @@ _EXTRACT_JS = r"""
     const text = (node.innerText || "").trim();
     if (!text) continue;
 
-    // name: prefer an h-tag, else the first non-empty line
-    let name = "";
-    const h = node.querySelector("h1,h2,h3,h4,h5,h6");
-    if (h && h.innerText.trim()) {
-      name = h.innerText.trim();
-    } else {
+    // accessibility string: a <p> or aria-label containing "Costs:"
+    let acc = "";
+    for (const p of node.querySelectorAll("p")) {
+      if (/Costs:/.test(p.textContent)) { acc = p.textContent.trim(); break; }
+    }
+    if (!acc) {
+      const a = node.querySelector('[aria-label*="Costs:"]');
+      if (a) acc = a.getAttribute("aria-label").trim();
+    }
+
+    // image: first <img> with a real http src; its alt is the clean dish name
+    let image = "", imgAlt = "";
+    for (const img of node.querySelectorAll("img")) {
+      const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+      if (src && src.startsWith("http")) { image = src; imgAlt = (img.alt || "").trim(); break; }
+    }
+
+    // name: img alt > parsed from acc string > first sensible innerText line
+    let name = imgAlt;
+    if (!name && acc) {
+      const m = acc.match(/^(?:Veg Item|Non-veg item|Egg item)\.\s*(.*?)\.\s*(?:This item is a Bestseller,\s*)?Costs:/i);
+      if (m) name = m[1].trim();
+    }
+    if (!name) {
       const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
-      name = lines[0] || "";
+      name = lines.find(l => !/Costs:|Swipe right|^ADD$/i.test(l)) || lines[0] || "";
     }
     if (!name) continue;
 
-    // price
+    // price: prefer "Costs: <N> rupees" from acc, else a ₹/Rs match in text
     let price = "";
-    const pm = text.match(priceRe);
-    if (pm) price = pm[0].replace(/\s+/g, "");
-
-    // description: longest line that isn't the name and isn't a price/rating
-    let description = "";
-    const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
-    for (const line of lines) {
-      if (line === name) continue;
-      if (priceRe.test(line)) continue;
-      if (/^[\d.]+\s*$/.test(line)) continue;       // bare numbers/ratings
-      if (/ADD|customis/i.test(line)) continue;     // add buttons
-      if (line.length > description.length) description = line;
+    const cm = (acc || text).match(/Costs:\s*([\d,]+)\s*rupees/i);
+    if (cm) {
+      price = "₹" + cm[1];
+    } else {
+      const pm = text.match(priceRe);
+      if (pm) price = pm[0].replace(/\s+/g, "");
     }
-    if (description.length < 8) description = "";    // likely not a real desc
 
-    // image: first <img> with a real src (skip data: placeholders)
-    let image = "";
-    const imgs = Array.from(node.querySelectorAll("img"));
-    for (const img of imgs) {
-      const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
-      if (src && src.startsWith("http")) { image = src; break; }
+    // description: the "Description: ..." span of the acc string, if present
+    let description = "";
+    if (acc) {
+      const dm = acc.match(/Description:\s*(.*?)(?:\s*This item is customizable\.|\s*Swipe right to add)/i);
+      if (dm) description = dm[1].trim();
     }
 
     const key = name + "|" + price;
@@ -177,21 +208,62 @@ async def download_image(
     return filename
 
 
-async def scrape(url: str) -> None:
+def find_target_page(pages, url: str):
+    """Pick the already-open Swiggy tab that matches the given URL.
+
+    Prefers an exact restaurant-id match (rest<digits>), then any open
+    swiggy.com restaurant tab. Returns the matching page or None.
+    """
+    rest_id = None
+    m = re.search(r"rest\d+", url)
+    if m:
+        rest_id = m.group(0)
+
+    swiggy_pages = [pg for pg in pages if "swiggy.com" in pg.url]
+    if rest_id:
+        for pg in swiggy_pages:
+            if rest_id in pg.url:
+                return pg
+    for pg in swiggy_pages:
+        if "/restaurant" in pg.url or "/city/" in pg.url:
+            return pg
+    return swiggy_pages[0] if swiggy_pages else None
+
+
+async def scrape(url: str, port: int = CDP_PORT) -> None:
     slug = restaurant_slug(url)
     out_dir = Path(slug)
     images_dir = out_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            user_agent=CHROME_UA,
-            viewport={"width": 1366, "height": 900},
-        )
-        page = await context.new_page()
-        print(f"[load] {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            browser = await p.chromium.connect_over_cdp(
+                f"http://localhost:{port}", timeout=10000
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] could not connect to Chrome on port {port}: {exc}")
+            print("\nStart Chrome with remote debugging first, e.g.:")
+            print('  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\')
+            print(f'      --remote-debugging-port={port} '
+                  '--user-data-dir="$HOME/.swiggy-chrome"')
+            print("then open the restaurant page in it and re-run this script.")
+            return
+
+        # Gather every open tab across the real browser's contexts.
+        pages = [pg for ctx in browser.contexts for pg in ctx.pages]
+        page = find_target_page(pages, url)
+
+        if page is None:
+            # No Swiggy tab open — open one in the existing (human) context.
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await ctx.new_page()
+            print(f"[open] no Swiggy tab found; navigating to {url}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(5)
+        else:
+            print(f"[attach] using open tab: {page.url}")
+        await page.bring_to_front()
 
         # slow scroll to trigger lazy images
         print("[scroll] triggering lazy-loaded images...")
@@ -204,7 +276,8 @@ async def scrape(url: str) -> None:
             print("[warn] networkidle timeout; extracting anyway")
 
         dishes, used = await extract_dishes(page)
-        await browser.close()
+        # Do NOT call browser.close() — that could close the user's tabs.
+        # Exiting the async_playwright context just disconnects from Chrome.
 
     if not dishes:
         print("[done] no dishes found with any selector. "
@@ -260,10 +333,12 @@ async def scrape(url: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        print('usage: python scraper.py "<swiggy restaurant url>"')
+    if len(sys.argv) < 2:
+        print('usage: python scraper.py "<swiggy restaurant url>" [cdp_port]')
+        print(f"(connects to Chrome on port {CDP_PORT} by default)")
         sys.exit(1)
-    asyncio.run(scrape(sys.argv[1]))
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else CDP_PORT
+    asyncio.run(scrape(sys.argv[1], port))
 
 
 if __name__ == "__main__":
