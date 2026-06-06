@@ -1,0 +1,13 @@
+# Python virtualenv
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Personal Claude Code instructions (private)
+CLAUDE.local.md
+
+# Scraper output (restaurant folders contain menu.csv + downloaded images)
+# Tracked folders are created at runtime named after the restaurant slug.
+*/menu.csv
+*/images/
